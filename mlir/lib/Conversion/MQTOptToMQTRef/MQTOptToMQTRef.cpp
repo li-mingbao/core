@@ -10,13 +10,13 @@
 
 // macro to add the conversion pattern from any opt gate operation to the same
 // gate operation in the ref dialect
+#include "mlir/Transforms/RegionUtils.h"
 #define ADD_CONVERT_PATTERN(gate)                                              \
   patterns                                                                     \
       .add<ConvertMQTOptGateOp<::mqt::ir::opt::gate, ::mqt::ir::ref::gate>>(   \
           typeConverter, context);
 
 #include "mlir/Conversion/MQTOptToMQTRef/MQTOptToMQTRef.h"
-
 #include "mlir/Dialect/MQTOpt/IR/MQTOptDialect.h"
 #include "mlir/Dialect/MQTRef/IR/MQTRefDialect.h"
 
@@ -24,9 +24,12 @@
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Func/Transforms/FuncConversions.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/IR/BlockSupport.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include <mlir/IR/IRMapping.h>
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/PatternMatch.h>
@@ -276,8 +279,137 @@ struct ConvertMQTOptGateOp final : OpConversionPattern<MQTGateOptOp> {
   }
 };
 
+struct ConvertCallOp final : OpConversionPattern<func::CallOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::CallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    SmallVector<Type> resultTypes;
+
+    for (auto type : op->getResultTypes()) {
+      if (!isa<opt::QubitType>(type)) {
+        resultTypes.push_back(type);
+      }
+    }
+    rewriter.create<func::CallOp>(op->getLoc(), adaptor.getCallee(),
+                                  resultTypes, adaptor.getOperands());
+
+    rewriter.replaceOp(op, adaptor.getOperands());
+    return success();
+  }
+};
+
+struct ConvertFuncOp final : OpConversionPattern<func::FuncOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::FuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    SmallVector<Type> argumentTypes;
+    auto refType = ref::QubitType::get(rewriter.getContext());
+
+    for (auto blockArg : op.front().getArguments()) {
+      if (isa<opt::QubitType>(blockArg.getType())) {
+        blockArg.setType(refType);
+        argumentTypes.push_back(refType);
+      } else {
+        argumentTypes.push_back(blockArg.getType());
+      }
+    }
+
+    SmallVector<Type> resultTypes;
+    for (auto type : op->getResultTypes()) {
+      if (!isa<opt::QubitType>(type)) {
+        resultTypes.push_back(type);
+      }
+    }
+    auto newFuncType =
+        rewriter.getFunctionType(argumentTypes, resultTypes); // void
+    op.setFunctionType(newFuncType);
+    return success();
+  }
+};
+
+struct ConvertReturnOp final : OpConversionPattern<func::ReturnOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::ReturnOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    rewriter.create<func::ReturnOp>(op->getLoc());
+    rewriter.eraseOp(op);
+
+    return success();
+  }
+};
+struct ConvertForOp final : OpConversionPattern<scf::ForOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::ForOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    // Create a new for-loop with no iter_args
+    auto newFor = rewriter.create<scf::ForOp>(
+        op.getLoc(), adaptor.getLowerBound(), adaptor.getUpperBound(),
+        adaptor.getStep(), ValueRange{});
+
+    // Map induction variable only (no iter_args)
+    IRMapping mapping;
+    mapping.map(op.getInductionVar(), newFor.getInductionVar());
+
+    Block* newBlock = newFor.getBody();
+    for (auto operation : op.getRegionIterArgs()) {
+      if (operation.getType() == opt::QubitType::get(rewriter.getContext())) {
+        operation.replaceAllUsesWith(adaptor.getInitArgs()[0]);
+      }
+    }
+
+    rewriter.setInsertionPoint(newBlock->getTerminator());
+    // Clone body operations except for scf.yield
+    for (Operation& oldOp : op.getBody()->getOperations()) {
+      if (!llvm::isa<scf::YieldOp>(oldOp)) {
+        rewriter.clone(oldOp, mapping);
+      }
+    }
+    auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+    funcOp.print(llvm::outs());
+    rewriter.replaceOp(op, adaptor.getInitArgs());
+
+    return success();
+  }
+};
+struct ConvertYieldOp final : OpConversionPattern<scf::YieldOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    // rewriter.eraseOp(op);
+
+    return success();
+  }
+};
 struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
   using MQTOptToMQTRefBase::MQTOptToMQTRefBase;
+
+  void convertLoopRecursively(Operation* op, ConversionTarget& target,
+                              FrozenRewritePatternSet& patterns) {
+    for (Region& region : op->getRegions()) {
+      for (Block& block : region) {         // bottom-up block order
+        for (Operation& nestedOp : block) { // bottom-up op order
+          convertLoopRecursively(&nestedOp, target, patterns);
+        }
+      }
+    }
+
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    (void)applyPartialConversion(op, target, patterns, config);
+  }
   void runOnOperation() override {
     MLIRContext* context = &getContext();
     auto* module = getOperation();
@@ -288,7 +420,27 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
 
     target.addIllegalDialect<opt::MQTOptDialect>();
     target.addLegalDialect<ref::MQTRefDialect>();
-
+    target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
+      return !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      return !llvm::any_of(op.front().getArgumentTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
+      return !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context) ||
+               type == ref::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<scf::ForOp>([&](scf::ForOp op) {
+      return !llvm::any_of(op.getRegionIterArgs(), [&](BlockArgument type) {
+        return type.getType() == opt::QubitType::get(context);
+      });
+    });
     target.addDynamicallyLegalOp<memref::AllocOp>(
         [&](memref::AllocOp op) { return !isQubitType(op); });
     target.addDynamicallyLegalOp<memref::DeallocOp>(
@@ -297,13 +449,14 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
         [&](memref::LoadOp op) { return !isQubitType(op); });
     target.addDynamicallyLegalOp<memref::StoreOp>(
         [&](memref::StoreOp op) { return !isQubitType(op); });
-
+    target.addIllegalOp<scf::YieldOp>();
     patterns.add<ConvertMQTOptMemRefAlloc, ConvertMQTOptMemRefDealloc,
                  ConvertMQTOptMemRefStore, ConvertMQTOptMemRefLoad,
                  ConvertMQTOptAllocQubit, ConvertMQTOptDeallocQubit,
                  ConvertMQTOptQubit, ConvertMQTOptMeasure, ConvertMQTOptReset>(
         typeConverter, context);
-
+    patterns.add<ConvertCallOp, ConvertReturnOp, ConvertFuncOp, ConvertForOp,
+                 ConvertYieldOp>(typeConverter, context);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)
@@ -339,31 +492,11 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
     ADD_CONVERT_PATTERN(RZXOp)
     ADD_CONVERT_PATTERN(XXminusYYOp)
     ADD_CONVERT_PATTERN(XXplusYYOp)
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-    // conversion of mqtopt types in func.func signatures
-    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
-        patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
-      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
-             typeConverter.isLegal(&op.getBody());
-    });
-
-    // conversion of mqtopt types in func.return
-    populateReturnOpTypeConversionPattern(patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::ReturnOp>(
-        [&](const func::ReturnOp op) { return typeConverter.isLegal(op); });
-
-    // conversion of mqtopt types in func.call
-    populateCallOpTypeConversionPattern(patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::CallOp>(
-        [&](const func::CallOp op) { return typeConverter.isLegal(op); });
-
-    // conversion of mqtopt types in control-flow ops; e.g. cf.br
-    populateBranchOpInterfaceTypeConversionPattern(patterns, typeConverter);
-
-    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
-      signalPassFailure();
-    }
+    convertLoopRecursively(module, target, frozenPatterns);
   };
 };
 

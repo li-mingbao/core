@@ -10,13 +10,13 @@
 
 // macro to add the conversion pattern from any ref gate operation to the same
 // gate operation in the opt dialect
+#include "mlir/IR/Block.h"
 #define ADD_CONVERT_PATTERN(gate)                                              \
   patterns                                                                     \
       .add<ConvertMQTRefGateOp<::mqt::ir::ref::gate, ::mqt::ir::opt::gate>>(   \
           typeConverter, context, &state);
 
 #include "mlir/Conversion/MQTRefToMQTOpt/MQTRefToMQTOpt.h"
-
 #include "mlir/Dialect/MQTOpt/IR/MQTOptDialect.h"
 #include "mlir/Dialect/MQTRef/IR/MQTRefDialect.h"
 
@@ -55,6 +55,8 @@ struct LoweringState {
   llvm::DenseMap<Value, Value> qubitIndexMap;
   /// @brief Map each initial ref register to its refQubits.
   llvm::DenseMap<Value, std::vector<Value>> qregQubitsMap;
+  /// @brief Map each initial funcOp to its refQubits.
+  llvm::DenseMap<func::FuncOp, std::vector<Value>> funcQubitsMap;
 };
 
 template <typename OpType>
@@ -383,6 +385,111 @@ struct ConvertMQTRefGateOp final : StatefulOpConversionPattern<MQTGateRefOp> {
   }
 };
 
+struct ConvertCallOpOpt final : StatefulOpConversionPattern<func::CallOp> {
+  using StatefulOpConversionPattern<func::CallOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::CallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    SmallVector<Type> resultTypes;
+
+    auto const inputs = op.getOperands();
+    SmallVector<Value> params;
+    SmallVector<Value> refQubits;
+    auto const optType = opt::QubitType::get(rewriter.getContext());
+    for (auto value : inputs) {
+      if (isa<ref::QubitType>(value.getType())) {
+        resultTypes.push_back(optType);
+        params.push_back(this->getState().qubitMap[value]);
+        refQubits.push_back(value);
+      } else {
+        resultTypes.push_back(value.getType());
+        params.push_back(value);
+      }
+    }
+
+    auto callOp = rewriter.create<func::CallOp>(
+        op->getLoc(), adaptor.getCallee(), resultTypes, params);
+
+    auto callResults = callOp->getResults();
+    for (auto refQubit : refQubits) {
+      while (!callResults.empty() &&
+             !isa<opt::QubitType>((*callResults.begin()).getType())) {
+        //       llvm::outs()<<"here2";
+        callResults.drop_front();
+      }
+      //  llvm::outs()<<"here";
+      this->getState().qubitMap[refQubit] = *callResults.begin();
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct ConvertFuncOpOpt final : StatefulOpConversionPattern<func::FuncOp> {
+  using StatefulOpConversionPattern<func::FuncOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::FuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    SmallVector<Type> argumentTypes;
+    auto optType = opt::QubitType::get(rewriter.getContext());
+    SmallVector<Type> resultTypes;
+    SmallVector<Value> refQubits;
+    for (auto type : op->getResultTypes()) {
+      if (!isa<ref::QubitType>(type)) {
+        resultTypes.push_back(type);
+      }
+    }
+    for (auto blockArg : op.front().getArguments()) {
+      if (isa<ref::QubitType>(blockArg.getType())) {
+        refQubits.emplace_back(blockArg);
+        getState().funcQubitsMap[op].emplace_back(blockArg);
+        blockArg.setType(optType);
+        getState().qubitMap[refQubits[0]] = blockArg;
+        argumentTypes.push_back(optType);
+        resultTypes.push_back(optType);
+
+      } else {
+        argumentTypes.push_back(blockArg.getType());
+      }
+    }
+
+    auto newFuncType = rewriter.getFunctionType(argumentTypes, resultTypes); //
+    op.setFunctionType(newFuncType);
+
+    op.walk([&](func::ReturnOp returnOp) {
+      returnOp->setAttr("needChange", rewriter.getStringAttr("yes"));
+    });
+    return success();
+  }
+};
+
+struct ConvertReturnOpOpt final : StatefulOpConversionPattern<func::ReturnOp> {
+  using StatefulOpConversionPattern<
+      func::ReturnOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(func::ReturnOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    auto const parentFunc = op->getParentOfType<func::FuncOp>();
+    SmallVector<Value> results;
+    results.append(op->getResults().begin(), op->getResults().end());
+    for (auto refQubit : this->getState().funcQubitsMap[parentFunc]) {
+      results.emplace_back(getState().qubitMap[refQubit]);
+    }
+
+    rewriter.create<func::ReturnOp>(op->getLoc(), results);
+
+    rewriter.eraseOp(op);
+
+    return success();
+  }
+};
+
 struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
   using MQTRefToMQTOptBase::MQTRefToMQTOptBase;
 
@@ -406,6 +513,19 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     target.addDynamicallyLegalOp<memref::LoadOp>(
         [&](memref::LoadOp op) { return !isQubitType(op); });
     target.addLegalOp<memref::StoreOp>();
+    target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
+      return !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return type == ref::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      return !llvm::any_of(op.front().getArgumentTypes(), [&](Type type) {
+        return type == ref::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
+      return !op->getAttrOfType<StringAttr>("needChange");
+    });
 
     patterns.add<ConvertMQTRefMemRefAlloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefDealloc>(typeConverter, context, &state);
@@ -415,7 +535,9 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     patterns.add<ConvertMQTRefQubit>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMeasure>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefReset>(typeConverter, context, &state);
-
+    patterns.add<ConvertCallOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertFuncOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertReturnOpOpt>(typeConverter, context, &state);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)
@@ -452,26 +574,6 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     ADD_CONVERT_PATTERN(XXminusYYOp)
     ADD_CONVERT_PATTERN(XXplusYYOp)
 
-    // conversion of mqtopt types in func.func signatures
-    // does not work for now as signature needs to be changed
-    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
-        patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
-      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
-             typeConverter.isLegal(&op.getBody());
-    });
-    // conversion of mqtref types in func.return
-    populateReturnOpTypeConversionPattern(patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::ReturnOp>(
-        [&](const func::ReturnOp op) { return typeConverter.isLegal(op); });
-
-    // conversion of mqtref types in func.call
-    populateCallOpTypeConversionPattern(patterns, typeConverter);
-    target.addDynamicallyLegalOp<func::CallOp>(
-        [&](const func::CallOp op) { return typeConverter.isLegal(op); });
-
-    // conversion of mqtref types in control-flow ops; e.g. cf.br
-    populateBranchOpInterfaceTypeConversionPattern(patterns, typeConverter);
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       signalPassFailure();
     }

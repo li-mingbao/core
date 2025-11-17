@@ -11,6 +11,8 @@
 // macro to add the conversion pattern from any opt gate operation to the same
 // gate operation in the ref dialect
 #include "mlir/Transforms/RegionUtils.h"
+
+#include "llvm/ADT/STLExtras.h"
 #define ADD_CONVERT_PATTERN(gate)                                              \
   patterns                                                                     \
       .add<ConvertMQTOptGateOp<::mqt::ir::opt::gate, ::mqt::ir::ref::gate>>(   \
@@ -351,7 +353,6 @@ struct ConvertForOp final : OpConversionPattern<scf::ForOp> {
   LogicalResult
   matchAndRewrite(scf::ForOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter& rewriter) const override {
-
     // Create a new for-loop with no iter_args
     auto newFor = rewriter.create<scf::ForOp>(
         op.getLoc(), adaptor.getLowerBound(), adaptor.getUpperBound(),
@@ -370,13 +371,19 @@ struct ConvertForOp final : OpConversionPattern<scf::ForOp> {
 
     rewriter.setInsertionPoint(newBlock->getTerminator());
     // Clone body operations except for scf.yield
-    for (Operation& oldOp : op.getBody()->getOperations()) {
+    for (Operation& oldOp :
+         llvm::make_early_inc_range(op.getBody()->getOperations())) {
       if (!llvm::isa<scf::YieldOp>(oldOp)) {
-        rewriter.clone(oldOp, mapping);
+        if (auto ope = dyn_cast<scf::ForOp>(oldOp)) {
+          (void)this->matchAndRewrite(ope, ope, rewriter);
+          rewriter.setInsertionPoint(newBlock->getTerminator());
+
+        } else {
+          rewriter.clone(oldOp, mapping);
+        }
       }
     }
-    auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
-    funcOp.print(llvm::outs());
+
     rewriter.replaceOp(op, adaptor.getInitArgs());
 
     return success();
@@ -396,20 +403,6 @@ struct ConvertYieldOp final : OpConversionPattern<scf::YieldOp> {
 struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
   using MQTOptToMQTRefBase::MQTOptToMQTRefBase;
 
-  void convertLoopRecursively(Operation* op, ConversionTarget& target,
-                              FrozenRewritePatternSet& patterns) {
-    for (Region& region : op->getRegions()) {
-      for (Block& block : region) {         // bottom-up block order
-        for (Operation& nestedOp : block) { // bottom-up op order
-          convertLoopRecursively(&nestedOp, target, patterns);
-        }
-      }
-    }
-
-    ConversionConfig config;
-    config.allowPatternRollback = false;
-    (void)applyPartialConversion(op, target, patterns, config);
-  }
   void runOnOperation() override {
     MLIRContext* context = &getContext();
     auto* module = getOperation();
@@ -421,12 +414,16 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
     target.addIllegalDialect<opt::MQTOptDialect>();
     target.addLegalDialect<ref::MQTRefDialect>();
     target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
-      return !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+      return !llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      }) && !llvm::any_of(op->getOperandTypes(), [&](Type type) {
         return type == opt::QubitType::get(context);
       });
     });
     target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
-      return !llvm::any_of(op.front().getArgumentTypes(), [&](Type type) {
+      return !llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      }) && !llvm::any_of(op.front().getArgumentTypes(), [&](Type type) {
         return type == opt::QubitType::get(context);
       });
     });
@@ -493,10 +490,12 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
     ADD_CONVERT_PATTERN(XXminusYYOp)
     ADD_CONVERT_PATTERN(XXplusYYOp)
     ConversionConfig config;
-    config.allowPatternRollback = false;
-    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+    config.allowPatternRollback = true;
 
-    convertLoopRecursively(module, target, frozenPatterns);
+    if (failed(applyPartialConversion(module, target, std::move(patterns),
+                                      config))) {
+      signalPassFailure();
+    }
   };
 };
 

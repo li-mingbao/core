@@ -395,7 +395,35 @@ struct ConvertYieldOp final : OpConversionPattern<scf::YieldOp> {
   LogicalResult
   matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter& rewriter) const override {
-    // rewriter.eraseOp(op);
+    rewriter.create<scf::YieldOp>(op->getLoc());
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+struct ConvertIfOp final : OpConversionPattern<scf::IfOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    auto newIf = rewriter.create<scf::IfOp>(op->getLoc(), ValueRange{},
+                                            op.getCondition(),
+                                            op.getElseRegion().empty());
+    // inline the regions
+    rewriter.inlineRegionBefore(op.getThenRegion(), newIf.getThenRegion(),
+                                newIf.getThenRegion().end());
+    if (!op.getElseRegion().empty()) {
+      rewriter.inlineRegionBefore(op.getElseRegion(), newIf.getElseRegion(),
+                                  newIf.getElseRegion().end());
+    }
+    rewriter.eraseBlock(&newIf.getThenRegion().front());
+
+    auto yield =
+        cast<scf::YieldOp>(newIf.getThenRegion().back().getTerminator());
+
+    newIf.getThenRegion().back().getTerminator()->print(llvm::outs());
+    rewriter.replaceOp(op, yield->getOperands());
 
     return success();
   }
@@ -438,6 +466,19 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
         return type.getType() == opt::QubitType::get(context);
       });
     });
+    target.addDynamicallyLegalOp<scf::IfOp>([&](scf::IfOp op) {
+      return !llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      });
+    });
+
+    target.addDynamicallyLegalOp<scf::YieldOp>([&](scf::YieldOp op) {
+      return !(llvm::isa<scf::IfOp>(op->getParentOp()) &&
+               llvm::any_of(op.getOperandTypes(), [&](Type type) {
+                 return type == opt::QubitType::get(context);
+               }));
+    });
+
     target.addDynamicallyLegalOp<memref::AllocOp>(
         [&](memref::AllocOp op) { return !isQubitType(op); });
     target.addDynamicallyLegalOp<memref::DeallocOp>(
@@ -446,14 +487,13 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
         [&](memref::LoadOp op) { return !isQubitType(op); });
     target.addDynamicallyLegalOp<memref::StoreOp>(
         [&](memref::StoreOp op) { return !isQubitType(op); });
-    target.addIllegalOp<scf::YieldOp>();
     patterns.add<ConvertMQTOptMemRefAlloc, ConvertMQTOptMemRefDealloc,
                  ConvertMQTOptMemRefStore, ConvertMQTOptMemRefLoad,
                  ConvertMQTOptAllocQubit, ConvertMQTOptDeallocQubit,
                  ConvertMQTOptQubit, ConvertMQTOptMeasure, ConvertMQTOptReset>(
         typeConverter, context);
     patterns.add<ConvertCallOp, ConvertReturnOp, ConvertFuncOp, ConvertForOp,
-                 ConvertYieldOp>(typeConverter, context);
+                 ConvertYieldOp, ConvertIfOp>(typeConverter, context);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)

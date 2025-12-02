@@ -10,7 +10,11 @@
 
 // macro to add the conversion pattern from any ref gate operation to the same
 // gate operation in the opt dialect
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
+
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #define ADD_CONVERT_PATTERN(gate)                                              \
   patterns                                                                     \
       .add<ConvertMQTRefGateOp<::mqt::ir::ref::gate, ::mqt::ir::opt::gate>>(   \
@@ -57,6 +61,12 @@ struct LoweringState {
   llvm::DenseMap<Value, std::vector<Value>> qregQubitsMap;
   /// @brief Map each initial funcOp to its refQubits.
   llvm::DenseMap<func::FuncOp, std::vector<Value>> funcQubitsMap;
+  /// @brief Map each initial funcOp to its refQubits.
+  llvm::DenseMap<Operation*, std::vector<Value>> regionMap;
+  /// @brief Map each initial funcOp to its refQubits.
+  llvm::DenseMap<Region*, llvm::DenseMap<Value, Value>> regionQubitMap;
+  /// @brief Collect qubits of each region
+  llvm::DenseMap<Region*, llvm::DenseSet<Value>> regionQubits;
 };
 
 template <typename OpType>
@@ -94,6 +104,42 @@ bool isQubitType(memref::LoadOp op) {
   return isQubitType(memRefType);
 }
 
+llvm::DenseSet<Value> collectRegionQubits(Operation* op, LoweringState* state,
+                                          MLIRContext* ctx) {
+
+  auto regions = op->getRegions();
+  DenseSet<Value> uniqueQubits;
+  for (auto& region : regions) {
+    auto& set = state->regionQubits[&region];
+
+    if (region.empty()) {
+      continue;
+    }
+
+    for (auto& operation : region.front().getOperations()) {
+      if (operation.getNumRegions() > 0) {
+        auto qubits = collectRegionQubits(&operation, state, ctx);
+        for (auto qubit : qubits) {
+          uniqueQubits.insert(qubit);
+          set.insert(qubit);
+        }
+      }
+      for (auto operand : operation.getOperands()) {
+        if (operand.getType() == ref::QubitType::get(ctx)) {
+          uniqueQubits.insert(operand);
+          set.insert(operand);
+        }
+      }
+      for (auto result : operation.getResults()) {
+        if (result.getType() == ref::QubitType::get(ctx)) {
+          uniqueQubits.insert(result);
+          set.insert(result);
+        }
+      }
+    }
+  }
+  return uniqueQubits;
+}
 } // namespace
 
 class MQTRefToMQTOptTypeConverter final : public TypeConverter {
@@ -190,6 +236,8 @@ struct ConvertMQTRefAllocQubit final
     auto optOp = rewriter.replaceOpWithNewOp<opt::AllocQubitOp>(op);
     const auto& optQubit = optOp.getQubit();
     getState().qubitMap.try_emplace(refQubit, optQubit);
+    auto* regionOp = op->getParentRegion();
+    getState().regionQubitMap[regionOp].try_emplace(refQubit, optQubit);
     return success();
   }
 };
@@ -228,6 +276,9 @@ struct ConvertMQTRefMemRefLoad final
     const auto& refMemRef = op.getMemref();
     const auto& refQubit = op.getResult();
     const auto& optQubit = optLoadOp.getResult();
+
+    auto* regionOp = op->getParentRegion();
+    getState().regionQubitMap[regionOp].try_emplace(refQubit, optQubit);
 
     // put the pair of the ref qubit and the latest opt qubit in the map
     getState().qubitMap.try_emplace(refQubit, optQubit);
@@ -269,7 +320,8 @@ struct ConvertMQTRefMeasure final
     auto newBit = optOp.getOutBit();
 
     getState().qubitMap[refQubit] = outOptQubit;
-
+    auto* regionOp = op->getParentRegion();
+    getState().regionQubitMap[regionOp][refQubit] = outOptQubit;
     // replace the old operation results with the new bits and delete
     // old operation
     rewriter.replaceOp(op, newBit);
@@ -343,18 +395,25 @@ struct ConvertMQTRefGateOp final : StatefulOpConversionPattern<MQTGateRefOp> {
   LogicalResult
   matchAndRewrite(MQTGateRefOp op, typename MQTGateRefOp::Adaptor /*adaptor*/,
                   ConversionPatternRewriter& rewriter) const override {
-    // Map ref qubits to opt qubits
-    auto mapQubits = [&](const auto& refQubits) {
+    auto regionOp = op->getParentRegion();
+    auto maps = this->getState().regionQubitMap[regionOp];
+    auto funcOp = op->template getParentOfType<mlir::func::FuncOp>();
+    funcOp.print(llvm::outs());
+    for (const auto& [key, value] : maps) {
+      llvm::outs() << key << " = " << value << "\n";
+    }
+    auto mapQubits2 = [&](const auto& refQubits) {
       std::vector<Value> optQubits;
       for (const auto& refQubit : refQubits) {
-        optQubits.emplace_back(this->getState().qubitMap[refQubit]);
+        optQubits.emplace_back(
+            this->getState().regionQubitMap[regionOp][refQubit]);
       }
       return optQubits;
     };
 
-    auto optInQubits = mapQubits(op.getInQubits());
-    auto optPosCtrlQubitsValues = mapQubits(op.getPosCtrlInQubits());
-    auto optNegCtrlQubitsValues = mapQubits(op.getNegCtrlInQubits());
+    auto optInQubits = mapQubits2(op.getInQubits());
+    auto optPosCtrlQubitsValues = mapQubits2(op.getPosCtrlInQubits());
+    auto optNegCtrlQubitsValues = mapQubits2(op.getNegCtrlInQubits());
 
     // Get optional attributes
     auto staticParams = op.getStaticParams()
@@ -377,7 +436,9 @@ struct ConvertMQTRefGateOp final : StatefulOpConversionPattern<MQTGateRefOp> {
     // Update qubit map
     const auto& optResults = optOp.getAllOutQubits();
     for (size_t i = 0; i < op.getAllInQubits().size(); i++) {
-      this->getState().qubitMap[op.getAllInQubits()[i]] = optResults[i];
+      //  this->getState().qubitMap[op.getAllInQubits()[i]] = optResults[i];
+      this->getState().regionQubitMap[regionOp][op.getAllInQubits()[i]] =
+          optResults[i];
     }
 
     rewriter.eraseOp(op);
@@ -424,6 +485,77 @@ struct ConvertCallOpOpt final : StatefulOpConversionPattern<func::CallOp> {
 
     rewriter.eraseOp(op);
     return success();
+  }
+};
+
+struct ConvertIfOpOpt final : StatefulOpConversionPattern<scf::IfOp> {
+  using StatefulOpConversionPattern<scf::IfOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    /*
+
+      auto newIf = rewriter.create<scf::IfOp>(op->getLoc(), TypeRange{optType},
+                                              op.getCondition(), true);
+      newIf->setAttr("needChange", rewriter.getStringAttr("no"));
+
+      //
+
+      Value operand;
+      auto& ops = op.getThenRegion().front().getOperations();
+      for (auto& i : ops) {
+        auto hOp = dyn_cast<ref::HOp>(i);
+        if (hOp) {
+          operand = hOp->getOperand(0);
+          auto optQubit =
+              getState().regionQubitMap[op->getParentRegion()][operand];
+          getState().regionQubitMap[&newIf.getThenRegion()].try_emplace(operand,
+                                                                        optQubit);
+        }
+      }
+
+      rewriter.eraseBlock(&newIf.getThenRegion().front());
+      rewriter.inlineRegionBefore(op.getThenRegion(), newIf.getThenRegion(),
+                                  newIf.getThenRegion().end());
+      if (!op.getElseRegion().empty()) {
+        rewriter.eraseBlock(&newIf.getElseRegion().front());
+        rewriter.inlineRegionBefore(op.getElseRegion(), newIf.getElseRegion(),
+                                    newIf.getElseRegion().end());
+      } else {
+        rewriter.setInsertionPointToEnd(&newIf.getElseRegion().back());
+        rewriter.create<scf::YieldOp>(op.getLoc(), operand);
+        //  auto* elseTerminator = newIf.getElseRegion().back().getTerminator();
+        // rewriter.replaceOpWithNewOp<scf::YieldOp>(elseTerminator, operand);
+      }
+      auto* thenTerminator = newIf.getThenRegion().back().getTerminator();
+      rewriter.setInsertionPointToEnd(&newIf.getThenRegion().back());
+      rewriter.eraseOp(thenTerminator);
+      rewriter.create<scf::YieldOp>(op.getLoc(), operand);
+  */
+    /*
+      auto alloc = rewriter.create<opt::AllocQubitOp>(op->getLoc());
+      auto const optType = opt::QubitType::get(rewriter.getContext());
+      auto newIf = rewriter.create<scf::IfOp>(op.getLoc(), TypeRange{optType},
+                                              adaptor.getCondition(), false);
+      rewriter.setInsertionPointToEnd(&newIf.getThenRegion().back());
+      rewriter.create<scf::YieldOp>(op.getLoc(), alloc->getResult(0));
+      /*
+      rewriter.setInsertionPointToEnd(&newIf.getElseRegion().back());
+      rewriter.create<scf::YieldOp>(op.getLoc(), alloc->getResult(0));
+      */
+
+    auto b = rewriter.create<ref::AllocQubitOp>(op->getLoc());
+
+    auto newIf = rewriter.create<scf::IfOp>(op->getLoc(), ValueRange{},
+                                            adaptor.getCondition(), false);
+    newIf->setAttr("needChange", rewriter.getStringAttr("no"));
+
+    rewriter.replaceOp(op, newIf->getResults());
+    auto funcOp = op->getParentOfType<mlir::func::FuncOp>();
+    funcOp.print(llvm::outs());
+    return success();
+    // inline the regions
   }
 };
 
@@ -526,6 +658,42 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
       return !op->getAttrOfType<StringAttr>("needChange");
     });
+    /*
+        target.addDynamicallyLegalOp<scf::IfOp>([&](scf::IfOp op) {
+          if (op->getAttrOfType<StringAttr>("needChange")) {
+
+            return true;
+          }
+          for (auto& opt : op.getThenRegion().front()) {
+            for (auto operand : opt.getOperands()) {
+              if (operand.getType() == ref::QubitType::get(context)) {
+                return false;
+              }
+            }
+          }
+          return true;
+        });
+        */
+    target.addDynamicallyLegalOp<scf::IfOp>([&](scf::IfOp op) {
+      return op->getAttrOfType<StringAttr>("needChange") != nullptr;
+    });
+    /*
+    target.addDynamicallyLegalOp<scf::IfOp>(
+        [&](scf::IfOp op) { return op->getResults().size() > 0; });
+    }}*/
+    collectRegionQubits(module, &state, context);
+    auto map = state.regionQubits;
+    for (auto [region, qubits] : map) {
+
+      auto* op = region->getParentOp();
+      llvm::outs() << "current op ";
+      region->front().print(llvm::outs());
+      llvm::outs() << "\n";
+      for (auto qubit : qubits) {
+        qubit.print(llvm::outs());
+        llvm::outs() << "value\n";
+      }
+    }
 
     patterns.add<ConvertMQTRefMemRefAlloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefDealloc>(typeConverter, context, &state);
@@ -538,6 +706,7 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     patterns.add<ConvertCallOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertFuncOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertReturnOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertIfOpOpt>(typeConverter, context, &state);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)
@@ -573,10 +742,11 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     ADD_CONVERT_PATTERN(RZXOp)
     ADD_CONVERT_PATTERN(XXminusYYOp)
     ADD_CONVERT_PATTERN(XXplusYYOp)
-
-    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
-      signalPassFailure();
-    }
+    /*
+        if (failed(applyPartialConversion(module, target, std::move(patterns))))
+       { signalPassFailure();
+        }
+        */
   };
 };
 

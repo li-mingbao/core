@@ -67,8 +67,6 @@ struct LoweringState {
   llvm::DenseMap<Operation*, llvm::SetVector<Value>> regionMap;
   /// @brief Map each initial funcOp to its refQubits.
   llvm::DenseMap<Region*, llvm::DenseMap<Value, Value>> regionQubitMap;
-  /// @brief Collect qubits of each region
-  llvm::DenseMap<Region*, llvm::SetVector<Value>> regionQubits;
 };
 
 template <typename OpType>
@@ -113,7 +111,6 @@ llvm::SetVector<Value> collectRegionQubits(Operation* op, LoweringState* state,
   auto regions = op->getRegions();
   SetVector<Value> uniqueQubits;
   for (auto& region : regions) {
-    auto& set = state->regionQubits[&region];
 
     // skip empty regions e.g. empty else region of an If operation
     if (region.empty()) {
@@ -127,21 +124,18 @@ llvm::SetVector<Value> collectRegionQubits(Operation* op, LoweringState* state,
         auto qubits = collectRegionQubits(&operation, state, ctx);
         for (auto qubit : qubits) {
           uniqueQubits.insert(qubit);
-          set.insert(qubit);
         }
       }
       // collect qubits form the operands
       for (auto operand : operation.getOperands()) {
         if (operand.getType() == ref::QubitType::get(ctx)) {
           uniqueQubits.insert(operand);
-          set.insert(operand);
         }
       }
       // collect qubits from the results
       for (auto result : operation.getResults()) {
         if (result.getType() == ref::QubitType::get(ctx)) {
           uniqueQubits.insert(result);
-          set.insert(result);
         }
       }
     }
@@ -509,7 +503,7 @@ struct ConvertIfOpOpt final : StatefulOpConversionPattern<scf::IfOp> {
     }
     auto const optType = opt::QubitType::get(rewriter.getContext());
     SmallVector<Type> resultTypes;
-    resultTypes.push_back(optType);
+    resultTypes.assign(refQubits.size(), optType);
 
     auto newIf = rewriter.create<scf::IfOp>(
         op->getLoc(), TypeRange{resultTypes}, op.getCondition(), true);
@@ -775,7 +769,7 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
       return !(op->getAttrOfType<StringAttr>("moreChange"));
     });
     fixYieldPattern.add<ConvertYieldOpOpt2>(typeConverter, context, &state);
-    llvm::outs() << "part1 done\n";
+
     if (failed(applyPartialConversion(module, fixYieldTarget,
                                       std::move(fixYieldPattern)))) {
       signalPassFailure();

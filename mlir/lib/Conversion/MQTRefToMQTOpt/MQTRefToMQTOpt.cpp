@@ -140,7 +140,8 @@ llvm::SetVector<Value> collectRegionQubits(Operation* op, LoweringState* state,
       }
     }
   }
-  if (!uniqueQubits.empty() && llvm::isa<scf::IfOp>(op)) {
+  if (!uniqueQubits.empty() &&
+      (llvm::isa<scf::IfOp>(op) || (llvm::isa<scf::ForOp>(op)))) {
     state->regionMap[op] = uniqueQubits;
     op->setAttr("needChange", StringAttr::get(ctx, "yes"));
   }
@@ -664,6 +665,63 @@ struct ConvertYieldOpOpt2 final : StatefulOpConversionPattern<scf::YieldOp> {
   }
 };
 
+struct ConvertForOpOpt final : StatefulOpConversionPattern<scf::ForOp> {
+  using StatefulOpConversionPattern<scf::ForOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::ForOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    auto* region = op->getParentRegion();
+    auto& qubitMap = getState().regionQubitMap[region];
+
+    auto refQubits = getState().regionMap[op];
+    SmallVector<Value> values;
+    values.reserve(refQubits.size());
+    for (auto qubit : refQubits) {
+      values.push_back(qubit);
+    }
+
+    SmallVector<Value> optQubits;
+    for (auto [refQubit, optQubit] : qubitMap) {
+      optQubits.push_back(optQubit);
+    }
+    // Create a new for-loop with no iter_args
+    auto newFor = rewriter.create<scf::ForOp>(
+        op.getLoc(), adaptor.getLowerBound(), adaptor.getUpperBound(),
+        adaptor.getStep(), ValueRange(optQubits));
+    auto& srcBlock = op.getRegion().front();
+    auto& dstBlock = newFor.getRegion().front();
+    dstBlock.getOperations().splice(dstBlock.end(), srcBlock.getOperations());
+
+    rewriter.setInsertionPointToEnd(&dstBlock);
+    auto yield = dyn_cast<scf::YieldOp>(dstBlock.getTerminator());
+    Operation* newYieldOp = nullptr;
+    if (yield == nullptr) {
+      newYieldOp = rewriter.create<scf::YieldOp>(op->getLoc(), values);
+    } else {
+      newYieldOp = rewriter.replaceOpWithNewOp<scf::YieldOp>(yield, values);
+    }
+    newYieldOp->setAttr("needChange", rewriter.getStringAttr("yes"));
+    auto& newRegion = newFor.getRegion();
+
+    auto& regionQubitMap = getState().regionQubitMap[&newRegion];
+
+    for (const auto& refQubit : refQubits) {
+      regionQubitMap.try_emplace(refQubit, newRegion.getArgument(1));
+    }
+
+    rewriter.setInsertionPoint(op);
+
+    auto& map = getState().regionQubitMap[op->getParentRegion()];
+    for (size_t i = 0; i < newFor->getResults().size(); i++) {
+      map[refQubits[i]] = newFor->getResult(i);
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
   using MQTRefToMQTOptBase::MQTRefToMQTOptBase;
 
@@ -711,6 +769,9 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     target.addDynamicallyLegalOp<scf::YieldOp>([&](scf::YieldOp op) {
       return !(op->getAttrOfType<StringAttr>("needChange"));
     });
+    target.addDynamicallyLegalOp<scf::ForOp>([&](scf::ForOp op) {
+      return !(op->getAttrOfType<StringAttr>("needChange"));
+    });
     patterns.add<ConvertMQTRefMemRefAlloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefDealloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefLoad>(typeConverter, context, &state);
@@ -724,6 +785,7 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     patterns.add<ConvertReturnOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertIfOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertYieldOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertForOpOpt>(typeConverter, context, &state);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)

@@ -10,18 +10,18 @@
 
 // macro to add the conversion pattern from any opt gate operation to the same
 // gate operation in the ref dialect
-#include "mlir/Transforms/RegionUtils.h"
 
-#include "llvm/ADT/STLExtras.h"
 #define ADD_CONVERT_PATTERN(gate)                                              \
   patterns                                                                     \
       .add<ConvertMQTOptGateOp<::mqt::ir::opt::gate, ::mqt::ir::ref::gate>>(   \
           typeConverter, context);
 
 #include "mlir/Conversion/MQTOptToMQTRef/MQTOptToMQTRef.h"
+
 #include "mlir/Dialect/MQTOpt/IR/MQTOptDialect.h"
 #include "mlir/Dialect/MQTRef/IR/MQTRefDialect.h"
 
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/Support/Casting.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Func/Transforms/FuncConversions.h>
@@ -389,6 +389,7 @@ struct ConvertForOp final : OpConversionPattern<scf::ForOp> {
     return success();
   }
 };
+
 struct ConvertYieldOp final : OpConversionPattern<scf::YieldOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -401,6 +402,7 @@ struct ConvertYieldOp final : OpConversionPattern<scf::YieldOp> {
     return success();
   }
 };
+
 struct ConvertIfOp final : OpConversionPattern<scf::IfOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -422,12 +424,57 @@ struct ConvertIfOp final : OpConversionPattern<scf::IfOp> {
     auto yield =
         cast<scf::YieldOp>(newIf.getThenRegion().back().getTerminator());
 
-    newIf.getThenRegion().back().getTerminator()->print(llvm::outs());
     rewriter.replaceOp(op, yield->getOperands());
 
     return success();
   }
 };
+
+struct ConvertWhileOp final : OpConversionPattern<scf::WhileOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::WhileOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    auto inits = adaptor.getInits();
+    auto beforeArgs = op.getBeforeArguments();
+    auto afterArgs = op.getAfterArguments();
+    for (size_t i = 0; i < beforeArgs.size(); i++) {
+      beforeArgs[i].replaceAllUsesWith(inits[i]);
+      afterArgs[i].replaceAllUsesWith(inits[i]);
+    }
+
+    auto newWhileOp =
+        rewriter.create<scf::WhileOp>(op->getLoc(), ValueRange{}, ValueRange{});
+
+    auto* newBeforeBlock =
+        rewriter.createBlock(&newWhileOp.getBefore(), {}, {}, {});
+    auto* newAfterBlock =
+        rewriter.createBlock(&newWhileOp.getAfter(), {}, {}, {});
+    newBeforeBlock->getOperations().splice(newBeforeBlock->end(),
+                                           op.getBeforeBody()->getOperations());
+    newAfterBlock->getOperations().splice(newAfterBlock->end(),
+                                          op.getAfterBody()->getOperations());
+
+    rewriter.replaceOp(op, adaptor.getInits());
+    return success();
+  }
+};
+
+struct ConvertConditionOp final : OpConversionPattern<scf::ConditionOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::ConditionOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<scf::ConditionOp>(op, op.getCondition(),
+                                                  ValueRange{});
+    return success();
+  }
+};
+
 struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
   using MQTOptToMQTRefBase::MQTOptToMQTRefBase;
 
@@ -441,6 +488,7 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
 
     target.addIllegalDialect<opt::MQTOptDialect>();
     target.addLegalDialect<ref::MQTRefDialect>();
+
     target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
       return !llvm::any_of(op->getResultTypes(), [&](Type type) {
         return type == opt::QubitType::get(context);
@@ -473,10 +521,25 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
     });
 
     target.addDynamicallyLegalOp<scf::YieldOp>([&](scf::YieldOp op) {
-      return !(llvm::isa<scf::IfOp>(op->getParentOp()) &&
+      return !((llvm::isa<scf::IfOp>(op->getParentOp()) ||
+                llvm::isa<scf::WhileOp>(op->getParentOp())) &&
                llvm::any_of(op.getOperandTypes(), [&](Type type) {
                  return type == opt::QubitType::get(context);
                }));
+    });
+    target.addDynamicallyLegalOp<scf::WhileOp>([&](scf::WhileOp op) {
+      return !llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      }) && !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      });
+    });
+    target.addDynamicallyLegalOp<scf::ConditionOp>([&](scf::ConditionOp op) {
+      return !llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      }) && !llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return type == opt::QubitType::get(context);
+      });
     });
 
     target.addDynamicallyLegalOp<memref::AllocOp>(
@@ -492,8 +555,10 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
                  ConvertMQTOptAllocQubit, ConvertMQTOptDeallocQubit,
                  ConvertMQTOptQubit, ConvertMQTOptMeasure, ConvertMQTOptReset>(
         typeConverter, context);
-    patterns.add<ConvertCallOp, ConvertReturnOp, ConvertFuncOp, ConvertForOp,
-                 ConvertYieldOp, ConvertIfOp>(typeConverter, context);
+    patterns
+        .add<ConvertCallOp, ConvertReturnOp, ConvertFuncOp, ConvertForOp,
+             ConvertYieldOp, ConvertIfOp, ConvertWhileOp, ConvertConditionOp>(
+            typeConverter, context);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)
@@ -529,11 +594,8 @@ struct MQTOptToMQTRef final : impl::MQTOptToMQTRefBase<MQTOptToMQTRef> {
     ADD_CONVERT_PATTERN(RZXOp)
     ADD_CONVERT_PATTERN(XXminusYYOp)
     ADD_CONVERT_PATTERN(XXplusYYOp)
-    ConversionConfig config;
-    config.allowPatternRollback = true;
 
-    if (failed(applyPartialConversion(module, target, std::move(patterns),
-                                      config))) {
+    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
       signalPassFailure();
     }
   };

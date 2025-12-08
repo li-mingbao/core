@@ -411,7 +411,7 @@ struct ConvertIfOp final : OpConversionPattern<scf::IfOp> {
                   ConversionPatternRewriter& rewriter) const override {
     auto newIf = rewriter.create<scf::IfOp>(op->getLoc(), ValueRange{},
                                             op.getCondition(),
-                                            op.getElseRegion().empty());
+                                            !op.getElseRegion().empty());
     // inline the regions
     rewriter.inlineRegionBefore(op.getThenRegion(), newIf.getThenRegion(),
                                 newIf.getThenRegion().end());

@@ -141,7 +141,8 @@ llvm::SetVector<Value> collectRegionQubits(Operation* op, LoweringState* state,
     }
   }
   if (!uniqueQubits.empty() &&
-      (llvm::isa<scf::IfOp>(op) || (llvm::isa<scf::ForOp>(op)))) {
+      (llvm::isa<scf::IfOp>(op) || (llvm::isa<scf::ForOp>(op)) ||
+       llvm::isa<scf::WhileOp>(op))) {
     state->regionMap[op] = uniqueQubits;
     op->setAttr("needChange", StringAttr::get(ctx, "yes"));
   }
@@ -478,10 +479,10 @@ struct ConvertCallOpOpt final : StatefulOpConversionPattern<func::CallOp> {
     for (auto refQubit : refQubits) {
       while (!callResults.empty() &&
              !isa<opt::QubitType>((*callResults.begin()).getType())) {
-        //       llvm::outs()<<"here2";
+
         callResults.drop_front();
       }
-      //  llvm::outs()<<"here";
+
       this->getState().qubitMap[refQubit] = *callResults.begin();
     }
 
@@ -722,6 +723,122 @@ struct ConvertForOpOpt final : StatefulOpConversionPattern<scf::ForOp> {
   }
 };
 
+struct ConvertWhileOpOpt final : StatefulOpConversionPattern<scf::WhileOp> {
+  using StatefulOpConversionPattern<scf::WhileOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::WhileOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    auto& qubitMap = getState().regionQubitMap[op->getParentRegion()];
+    auto refQubits = getState().regionMap[op];
+
+    SmallVector<Value> values;
+    values.reserve(refQubits.size());
+    for (auto qubit : refQubits) {
+      values.push_back(qubit);
+    }
+    SmallVector<Value> optQubits;
+    SmallVector<Type> types(refQubits.size(),
+                            opt::QubitType::get(rewriter.getContext()));
+    for (auto [refQubit, optQubit] : qubitMap) {
+      optQubits.push_back(optQubit);
+    }
+    auto newWhileOp = rewriter.create<scf::WhileOp>(
+        op.getLoc(), TypeRange(types), ValueRange(optQubits));
+    auto& newBeforeRegion = newWhileOp.getBefore();
+    auto& newAfterRegion = newWhileOp.getAfter();
+    SmallVector<Location> locs(refQubits.size(), op->getLoc());
+    auto* newBeforeBlock =
+        rewriter.createBlock(&newBeforeRegion, {}, types, locs);
+    auto* newAfterBlock =
+        rewriter.createBlock(&newAfterRegion, {}, types, locs);
+
+    newBeforeBlock->getOperations().splice(newBeforeBlock->end(),
+                                           op.getBeforeBody()->getOperations());
+    newAfterBlock->getOperations().splice(newAfterBlock->end(),
+                                          op.getAfterBody()->getOperations());
+    rewriter.setInsertionPointToEnd(newBeforeBlock);
+    rewriter.replaceOpWithNewOp<scf::ConditionOp>(
+        newBeforeBlock->getTerminator(),
+        newBeforeBlock->getTerminator()->getOperand(0), values);
+    rewriter.setInsertionPointToEnd(newAfterBlock);
+    rewriter.replaceOpWithNewOp<scf::YieldOp>(newAfterBlock->getTerminator(),
+                                              values);
+    rewriter.setInsertionPoint(op);
+    newBeforeBlock->getTerminator()->setAttr("needChange",
+                                             rewriter.getStringAttr("yes"));
+    newAfterBlock->getTerminator()->setAttr("needChange",
+                                            rewriter.getStringAttr("yes"));
+
+    auto& newBeforeRegionMap =
+        getState().regionQubitMap[&newWhileOp.getBefore()];
+    auto& newAfterRegionMap = getState().regionQubitMap[&newWhileOp.getAfter()];
+    for (size_t i = 0; i < refQubits.size(); i++) {
+      newBeforeRegionMap.try_emplace(refQubits[i],
+                                     newWhileOp.getBeforeArguments()[i]);
+    }
+    for (size_t i = 0; i < refQubits.size(); i++) {
+      newAfterRegionMap.try_emplace(refQubits[i],
+                                    newWhileOp.getAfterArguments()[i]);
+    }
+
+    auto& map = getState().regionQubitMap[op->getParentRegion()];
+    for (size_t i = 0; i < newWhileOp->getResults().size(); i++) {
+      map[refQubits[i]] = newWhileOp->getResult(i);
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct ConvertConditionOpOpt final
+    : StatefulOpConversionPattern<scf::ConditionOp> {
+  using StatefulOpConversionPattern<
+      scf::ConditionOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::ConditionOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+    auto* region = op->getParentRegion();
+    auto& qubitMap = getState().regionQubitMap[region];
+
+    SmallVector<Value> optQubits;
+    for (auto refQubit : op->getOperands()) {
+      if (refQubit.getType() == ref::QubitType::get(rewriter.getContext())) {
+        optQubits.push_back(qubitMap[refQubit]);
+      }
+    }
+    auto newConditionOp = rewriter.replaceOpWithNewOp<scf::ConditionOp>(
+        op, op.getCondition(), optQubits);
+    newConditionOp->setAttr("moreChange", rewriter.getStringAttr("yes"));
+
+    return success();
+  }
+};
+struct ConvertConditionOpOpt2 final
+    : StatefulOpConversionPattern<scf::ConditionOp> {
+  using StatefulOpConversionPattern<
+      scf::ConditionOp>::StatefulOpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::ConditionOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter& rewriter) const override {
+
+    auto* region = op->getParentRegion();
+    auto& qubitMap = getState().regionQubitMap[region];
+
+    SmallVector<Value> optQubits;
+    for (auto [refQubit, optQubit] : qubitMap) {
+      optQubits.push_back(optQubit);
+    }
+    rewriter.replaceOpWithNewOp<scf::ConditionOp>(op, op.getCondition(),
+                                                  optQubits);
+
+    return success();
+  }
+};
+
 struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
   using MQTRefToMQTOptBase::MQTRefToMQTOptBase;
 
@@ -772,6 +889,12 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     target.addDynamicallyLegalOp<scf::ForOp>([&](scf::ForOp op) {
       return !(op->getAttrOfType<StringAttr>("needChange"));
     });
+    target.addDynamicallyLegalOp<scf::WhileOp>([&](scf::WhileOp op) {
+      return !(op->getAttrOfType<StringAttr>("needChange"));
+    });
+    target.addDynamicallyLegalOp<scf::ConditionOp>([&](scf::ConditionOp op) {
+      return !(op->getAttrOfType<StringAttr>("needChange"));
+    });
     patterns.add<ConvertMQTRefMemRefAlloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefDealloc>(typeConverter, context, &state);
     patterns.add<ConvertMQTRefMemRefLoad>(typeConverter, context, &state);
@@ -786,6 +909,8 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
     patterns.add<ConvertIfOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertYieldOpOpt>(typeConverter, context, &state);
     patterns.add<ConvertForOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertWhileOpOpt>(typeConverter, context, &state);
+    patterns.add<ConvertConditionOpOpt>(typeConverter, context, &state);
     ADD_CONVERT_PATTERN(GPhaseOp)
     ADD_CONVERT_PATTERN(IOp)
     ADD_CONVERT_PATTERN(BarrierOp)
@@ -826,13 +951,18 @@ struct MQTRefToMQTOpt final : impl::MQTRefToMQTOptBase<MQTRefToMQTOpt> {
       signalPassFailure();
     }
     RewritePatternSet fixYieldPattern(context);
-    ConversionTarget fixYieldTarget(*context);
-    fixYieldTarget.addDynamicallyLegalOp<scf::YieldOp>([&](scf::YieldOp op) {
+    ConversionTarget fixPatternTargets(*context);
+    fixPatternTargets.addDynamicallyLegalOp<scf::YieldOp>([&](scf::YieldOp op) {
       return !(op->getAttrOfType<StringAttr>("moreChange"));
     });
+    fixPatternTargets.addDynamicallyLegalOp<scf::ConditionOp>(
+        [&](scf::ConditionOp op) {
+          return !(op->getAttrOfType<StringAttr>("moreChange"));
+        });
     fixYieldPattern.add<ConvertYieldOpOpt2>(typeConverter, context, &state);
+    fixYieldPattern.add<ConvertConditionOpOpt2>(typeConverter, context, &state);
 
-    if (failed(applyPartialConversion(module, fixYieldTarget,
+    if (failed(applyPartialConversion(module, fixPatternTargets,
                                       std::move(fixYieldPattern)))) {
       signalPassFailure();
     }
